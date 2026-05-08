@@ -46,19 +46,19 @@ load_dotenv()
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 
 # Dual Models
-MODEL_A_PATH  = "./output/model_a_cricket.pkl"   # Pure Cricket (Fair Odds)
-MODEL_B_PATH  = "./output/betpredict_model.pkl"  # Market Momentum (Unified)
+MODEL_A_PATH  = "model_a_cricket.pkl"   # Pure Cricket (Fair Odds)
+MODEL_B_PATH  = "betpredict_model.pkl"  # Market Momentum (Unified)
 
-HISTORICAL_DB = "./output/cricsheet_parsed.csv"
-BETFAIR_DB    = "./data/parsed/betfair_ipl_only.csv"
+HISTORICAL_DB = "cricsheet_parsed.csv"
+BETFAIR_DB    = "betfair_ipl_only.csv"
 LABELED_DB_CANDIDATES = [
-    "./output/labeled_dataset.csv",
-    "./data/parsed/labeled_dataset.csv",
-    "./labeled_dataset.csv",
+    "labeled_dataset.csv",
+    "labeled_dataset.csv",
+    "labeled_dataset.csv",
 ]
-PRICE_FILE       = "./live/ws_price.json"
-LIVE_REPORT_FILE = "./live/live_report.json"
-MATCH_LOG_FILE   = "./live/match_history_log.json"
+PRICE_FILE       = "ws_price.json"
+LIVE_REPORT_FILE = "live_report.json"
+MATCH_LOG_FILE   = "match_history_log.json"
 
 RUNNER_TEAM_MAP = {
     "7671296": "Lucknow Super Giants",
