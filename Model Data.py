@@ -19,6 +19,9 @@ PATCHES APPLIED:
   ✓ FIX 5: LAY/BACK vetos now use EV-based math (fair_price vs breakeven_prob),
            not a hardcoded price floor. Old hardcoded MIN_LAY_ODDS / MAX_BACK_ODDS
            kept only as fallback when fair_price is unavailable.
+  ✓ FIX 6: Fair price now computed relative to MARKET FAVOURITE (not always batting
+           team). Probability is flipped when bowling team is the favourite, so the
+           value gap comparison is always apples-to-apples.
 """
 
 import asyncio
@@ -45,29 +48,30 @@ MARKET_ID    = "1.257823308"
 load_dotenv()
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 
-# Dual Models
-MODEL_A_PATH  = "model_a_cricket.pkl"   # Pure Cricket (Fair Odds)
-MODEL_B_PATH  = "betpredict_model.pkl"  # Market Momentum (Unified)
+MODEL_A_PATH  = "./output/model_a_cricket.pkl"   # Pure Cricket (Fair Odds)
+MODEL_B_PATH  = "./output/betpredict_model.pkl"  # Market Momentum (Unified)
 
-HISTORICAL_DB = "cricsheet_parsed.csv"
-BETFAIR_DB    = "betfair_ipl_only.csv"
+HISTORICAL_DB = "./output/cricsheet_parsed.csv"
+BETFAIR_DB    = "./data/parsed/betfair_ipl_only.csv"
 LABELED_DB_CANDIDATES = [
-    "labeled_dataset.csv",
-    "labeled_dataset.csv",
-    "labeled_dataset.csv",
+    "./output/labeled_dataset.csv",
+    "./data/parsed/labeled_dataset.csv",
+    "./labeled_dataset.csv",
 ]
-PRICE_FILE       = "ws_price.json"
-LIVE_REPORT_FILE = "live_report.json"
-MATCH_LOG_FILE   = "match_history_log.json"
+PRICE_FILE       = "./live/ws_price.json"
+LIVE_REPORT_FILE = "./live/live_report.json"
+MATCH_LOG_FILE   = "./live/match_history_log.json"
 
 RUNNER_TEAM_MAP = {
     "22121561": "Delhi Capitals",
     "2954260": "Kolkata Knight Riders"
 } 
-BANKROLL          = float(os.getenv("BANKROLL", "10000"))
-KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "0.25"))
-MAX_EXPOSURE_PCT  = float(os.getenv("MAX_EXPOSURE_PCT", "0.03"))
+BANKROLL          = float(os.getenv("BANKROLL", "2000"))
+KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "1.0"))
+MAX_EXPOSURE_PCT  = float(os.getenv("MAX_EXPOSURE_PCT", "0.30"))
 MIN_STAKE         = float(os.getenv("MIN_STAKE", "50"))
+TARGET_PROFIT_PCT = 0.10
+STOP_LOSS_PCT     = 0.20
 SIGNAL_TTL_S      = int(os.getenv("SIGNAL_TTL_S", "12"))
 INVALIDATE_PRICE_MOVE_PCT = float(os.getenv("INVALIDATE_PRICE_MOVE_PCT", "0.06"))
 INVALIDATE_RR_DELTA       = float(os.getenv("INVALIDATE_RR_DELTA", "2.5"))
@@ -76,14 +80,9 @@ INVALIDATE_RR_DELTA       = float(os.getenv("INVALIDATE_RR_DELTA", "2.5"))
 MIN_VALUE_GAP = 0.05  # 5% gap between Fair Odds and Market Odds required
 
 # ── SAFETY VETO THRESHOLDS ────────────────────────────────────────
-# EV-based veto: required edge over breakeven probability.
-# 5 percentage points = safety margin against model error, slippage, tail risk.
-# Tune up (8pp) for more conservative, down (3pp) for more aggressive.
-# Do NOT go below 3pp.
 EV_REQUIRED_EDGE_PP  = 0.05    # 5 percentage points
 
 # Fallback price floors used ONLY when fair_price is unavailable.
-# These exist so the system still has a safety net if Model A fails.
 FALLBACK_MIN_LAY_ODDS = 1.40
 FALLBACK_MAX_BACK_ODDS = 6.00
 
@@ -108,7 +107,7 @@ state = {
     "api_ball_by_ball":    [],
     "api_market_prices":   {},
     "api_last_post_epoch": 0.0,
-    "match_id":            "",      # 🆕 carried into snap for rule_engine
+    "match_id":            "",
 
     # ── Position Management ──
     "current_book": {},
@@ -121,7 +120,7 @@ state = {
 
     # ── Constraints ──
     "constraints": {
-        "max_stake_pct": 0.3,
+        "max_stake_pct": 1.0,
         "max_stake_amount": 1500.0,
         "profit_target_pct": 0.1,
         "confidence_threshold": 0.5,
@@ -188,7 +187,7 @@ def _kelly_stake(bankroll, odds, p_win, kelly_fraction=0.25,
     if is_lay:
         liability = risk_amount
         stake = liability / (odds - 1.0)
-    else:
+    else: 
         stake = risk_amount
         liability = stake
     if 0 < stake < min_stake:
@@ -271,30 +270,16 @@ def _explain_patterns(pattern_names):
 
 def _lay_ev_check(market_price: float, fair_price: Optional[float],
                   required_edge_pp: float = EV_REQUIRED_EDGE_PP) -> Tuple[bool, str]:
-    """
-    Check if a LAY at market_price is +EV given the model's fair_price.
-
-    LAY math:
-      Stake S at decimal D, liability = S*(D-1).
-      If laid team LOSES: win = +S
-      If laid team WINS:  loss = -S*(D-1)
-      Breakeven prob (laid team loses) = (D-1) / D
-
-    Returns (is_ok, reason_if_blocked).
-    """
     if market_price <= 1.0:
         return False, f"LAY at {market_price:.2f} — invalid price"
 
     if fair_price is None or fair_price <= 1.0:
-        # No fair price → fall back to hardcoded floor
         if market_price < FALLBACK_MIN_LAY_ODDS:
             return False, (f"LAY at {market_price:.2f} < {FALLBACK_MIN_LAY_ODDS} "
                            f"(no fair price for EV check)")
         return True, ""
 
-    # Model's predicted true probability that laid team LOSES
     true_lose_prob = 1.0 - (1.0 / fair_price)
-    # Breakeven probability needed for non-negative EV
     breakeven_lose_prob = (market_price - 1.0) / market_price
     edge_pp = true_lose_prob - breakeven_lose_prob
 
@@ -307,30 +292,16 @@ def _lay_ev_check(market_price: float, fair_price: Optional[float],
 
 def _back_ev_check(market_price: float, fair_price: Optional[float],
                    required_edge_pp: float = EV_REQUIRED_EDGE_PP) -> Tuple[bool, str]:
-    """
-    Check if a BACK at market_price is +EV given the model's fair_price.
-
-    BACK math:
-      Stake S at decimal D.
-      If backed team WINS:  win = +S*(D-1)
-      If backed team LOSES: loss = -S
-      Breakeven prob (backed team wins) = 1 / D
-
-    Returns (is_ok, reason_if_blocked).
-    """
     if market_price <= 1.0:
         return False, f"BACK at {market_price:.2f} — invalid price"
 
     if fair_price is None or fair_price <= 1.0:
-        # No fair price → fall back to hardcoded ceiling
         if market_price > FALLBACK_MAX_BACK_ODDS:
             return False, (f"BACK at {market_price:.2f} > {FALLBACK_MAX_BACK_ODDS} "
                            f"(no fair price for EV check)")
         return True, ""
 
-    # Model's predicted true probability that backed team WINS
     true_win_prob = 1.0 / fair_price
-    # Breakeven probability needed for non-negative EV
     breakeven_win_prob = 1.0 / market_price
     edge_pp = true_win_prob - breakeven_win_prob
 
@@ -345,18 +316,6 @@ def _back_ev_check(market_price: float, fair_price: Optional[float],
 
 def _safety_veto_check(action: str, market_price: float, snap: dict,
                        fair_price: Optional[float] = None) -> Tuple[str, List[str]]:
-    """
-    Hard safety vetos that override any model signal.
-    Returns (final_action, veto_reasons).
-
-    NEW (FIX 5):
-      - LAY veto uses EV math (fair_price vs market breakeven), not price floor.
-      - BACK veto same.
-      - Hardcoded MIN_LAY_ODDS / MAX_BACK_ODDS only used if fair_price missing.
-
-    Situational vetos (innings completion, no-data) unchanged — these protect
-    against trading in degenerate match states regardless of math.
-    """
     vetos = []
 
     if action == "WAIT":
@@ -367,24 +326,24 @@ def _safety_veto_check(action: str, market_price: float, snap: dict,
     rrr      = float(snap.get("rrr", 0.0))
     crr      = float(snap.get("crr", 0.0))
 
-    # Veto 1: Innings 1 essentially over (19.0+ overs)
+    # Veto 1: Innings 1 essentially over
     if innings == 1 and over >= END_OF_MATCH_OVER:
         vetos.append(f"Innings 1 near complete (over {over:.1f}) — no edge left")
         return "WAIT", vetos
 
-    # Veto 2: Innings 2 — match decided (very low RRR, batting team cruising)
+    # Veto 2: Innings 2 — match decided
     if innings == 2 and rrr > 0 and rrr <= MATCH_DECIDED_RRR:
         vetos.append(f"Match decided in innings 2 (RRR {rrr:.2f} <= {MATCH_DECIDED_RRR})")
         return "WAIT", vetos
 
-    # Veto 3 (REWORKED): LAY EV check
+    # Veto 3: LAY EV check
     if action == "LAY":
         ok, reason = _lay_ev_check(market_price, fair_price)
         if not ok:
             vetos.append(reason)
             return "WAIT", vetos
 
-    # Veto 4 (REWORKED): BACK EV check
+    # Veto 4: BACK EV check
     if action == "BACK":
         ok, reason = _back_ev_check(market_price, fair_price)
         if not ok:
@@ -396,7 +355,7 @@ def _safety_veto_check(action: str, market_price: float, snap: dict,
         vetos.append(f"Late innings 2, CRR {crr:.1f} >> RRR {rrr:.1f} — chase essentially done")
         return "WAIT", vetos
 
-    # Veto 6: No score data = stale state, refuse to trade
+    # Veto 6: No score data = stale state
     if snap.get("score", "0/0") == "0/0" and over == 0.0:
         vetos.append("No live match data — refusing to trade on stale state")
         return "WAIT", vetos
@@ -407,7 +366,6 @@ def _safety_veto_check(action: str, market_price: float, snap: dict,
 # ── POSITION MANAGEMENT FUNCTIONS ─────────────────────────────────
 
 def _parse_position_data(api_payload: dict) -> Tuple[Dict, List[str]]:
-    """Extract position data from API payload. Returns (position_state, warnings)."""
     warnings = []
     position_state = {
         "current_book": api_payload.get("current_book", {}),
@@ -427,7 +385,6 @@ def _validate_stake_against_constraints(
     available_capital: float,
     constraints: Dict,
 ) -> Tuple[float, List[str]]:
-    """Validate stake against constraints. Returns (final_stake, warnings)."""
     warnings = []
     adjusted_stake = proposed_stake
 
@@ -456,7 +413,6 @@ def _calculate_position_impact(
     current_book: Dict,
     total_exposure: float,
 ) -> Dict:
-    """Calculate how new trade impacts position."""
     impact = {
         "trade_pnl": proposed_stake if action == "LAY" else -proposed_stake,
         "new_exposure": total_exposure + proposed_stake,
@@ -588,11 +544,22 @@ trend_engine = (PriceTrendEngine(resolved_labeled) if resolved_labeled
 hist_engine  = HistoryEngine(HISTORICAL_DB)
 flip_tracker = OddsFlipTracker(BETFAIR_DB)
 
+# Global stats containers
+MODEL_A_TEAM_STATS = {}
+MODEL_A_VENUE_SCORES = {}
+MODEL_A_BATTER_AVG = {}
+MODEL_A_BOWLER_AVG = {}
+
 try:
     with open(MODEL_A_PATH, "rb") as f:
         pkg_a = pickle.load(f)
-        model_a, feat_cols_a = pkg_a["model"], pkg_a["feature_cols"]
-    print(f"[LOAD] Model A Loaded successfully.")
+        model_a = pkg_a["model"]
+        feat_cols_a = pkg_a["feature_cols"]
+        MODEL_A_TEAM_STATS = pkg_a.get("team_stats", {})
+        MODEL_A_VENUE_SCORES = pkg_a.get("venue_avg_scores", {})
+        MODEL_A_BATTER_AVG = pkg_a.get("batter_avg", {})
+        MODEL_A_BOWLER_AVG = pkg_a.get("bowler_avg", {})
+    print(f"[LOAD] Model A Loaded successfully. Features: {feat_cols_a}")
 except Exception as e:
     print(f"[FATAL] Model A Load Fail: {e}")
     exit(1)
@@ -611,7 +578,6 @@ def _ingest_market_prices(mp: dict):
     Handles BOTH formats:
       - Decimal odds (e.g., 1.85)         → passed through unchanged
       - Bookmaker rates (e.g., 256, 37)   → converted via 1 + (rate/100)
-        (Bookmaker rate represents profit per ₹100 stake.)
     """
     runners = {}
     runner_names = {}
@@ -622,9 +588,6 @@ def _ingest_market_prices(mp: dict):
         except Exception:
             continue
 
-        # Bookmaker → decimal heuristic.
-        # NOTE: threshold=10 is imperfect (decimal 12+ exists for collapsing
-        # underdogs). Consider passing explicit format flag in payload long-term.
         if back_p >= 10:
             back_p = 1.0 + (back_p / 100.0)
         if lay_p >= 10:
@@ -660,7 +623,6 @@ def signal_endpoint():
     body = request.get_json(force=True) or {}
 
     with state_lock:
-        # 🆕 FIX 4: Read match_id so rule_engine can do per-match state reset.
         state["match_id"] = body.get("match_id", "")
 
         score_raw = body.get("score", "").strip()
@@ -703,6 +665,8 @@ def signal_endpoint():
             "fair_price":   float(full_prediction["ai_prediction"]["fair_price_model_a"]),
             "market_price": float(full_prediction["stake_sizing"].get("market_price", state["ltp"])),
             "stake":        float(full_prediction.get("constraint_validation", {}).get("final_stake_constrained", 0)),
+            "tp_price":     float(full_prediction["stake_sizing"].get("target_profit_price", 0)),
+            "sl_price":     float(full_prediction["stake_sizing"].get("stop_loss_price", 0)),
         }), 200
 
     veto_list = full_prediction.get("rule_engine", {}).get("veto_reasons", []) or []
@@ -719,6 +683,8 @@ def signal_endpoint():
         "team":       full_prediction["odds_deep_dive"].get("favourite") or "",
         "confidence": round(float(full_prediction["ai_prediction"]["confidence"]), 4),
         "reason":     reason_text,
+        "tp_price":   float(full_prediction["stake_sizing"].get("target_profit_price", 0)),
+        "sl_price":   float(full_prediction["stake_sizing"].get("stop_loss_price", 0)),
         "raw":        json.loads(json.dumps(full_prediction, default=json_safe))
     }
 
@@ -828,41 +794,107 @@ def get_full_features(detected_patterns, snap):
     _, over_int, ball_in_over = _parse_over_to_balls(over_val)
     ball_number = over_int * 6 + ball_in_over
     score_runs, score_wkts = _parse_score_string(snap.get("score", "0/0"))
-    
-    rr_pressure = (snap["rrr"] / max(snap["crr"], 0.1)) if snap["innings"] == 2 else (snap["crr"] / 8.0)
-    rr_pressure = max(0.0, min(5.0, rr_pressure))
-    
-    balls = _parse_recent_balls(snap.get("recent", ""))
-    last3 = balls[-3:] if len(balls) >= 3 else balls
-    rolling_3_runs = sum(b["runs"] for b in last3)
-    rolling_3_wickets = sum(b["wicket"] for b in last3)
+    target_score = int(ctx.get("target_score", 180))
+
+    # ── ROLLING BALL METRICS (18 and 12 balls) ──
+    bbb = snap.get("api_ball_by_ball", [])
+    bbb = [b for b in bbb if isinstance(b, dict)]
+
+    last_18 = bbb[-18:] if len(bbb) >= 18 else bbb
+    runs_last_18 = sum(b.get("runs", 0) for b in last_18)
+    wickets_last_18 = sum(b.get("wicket", 0) or b.get("is_wicket", 0) for b in last_18)
+
+    last_12 = bbb[-12:] if len(bbb) >= 12 else bbb
+    bowler_wickets_last_12 = sum(b.get("wicket", 0) or b.get("is_wicket", 0) for b in last_12)
+    recent_wickets_pressure = wickets_last_18 / 3.0 if last_18 else 0.0
+
+    # ── TEAM & VENUE STATS ──
+    bat_team = snap.get("bat_team", "Unknown")
+    bowl_team = snap.get("bowl_team", "Unknown")
+    venue = ctx.get("venue", "neutral")
+
+    batting_team_win_rate = float(MODEL_A_TEAM_STATS.get(bat_team, 0.5))
+    bowling_team_win_rate = float(MODEL_A_TEAM_STATS.get(bowl_team, 0.5))
+    team_strength_diff = batting_team_win_rate - bowling_team_win_rate
+    venue_avg_score = float(MODEL_A_VENUE_SCORES.get(venue, 160.0))
+
+    # ── RATE PRESSURES ──
+    crr = float(snap.get("crr", 0.0))
+    rrr = float(snap.get("rrr", 0.0))
+    run_rate_pressure = (rrr / max(crr, 0.1)) if snap["innings"] == 2 else (crr / 8.0)
+    run_rate_pressure = max(0.0, min(5.0, run_rate_pressure))
+    run_rate_gap = rrr - crr if snap["innings"] == 2 else 0.0
+
+    # ── SCORE & WICKET RATIOS ──
+    wickets_ratio = score_wkts / 10.0
+    balls_ratio = float(ball_number) / 120.0
+    relative_score = float(score_runs) / max(venue_avg_score, 1.0)
+
+    # ── PROJECTIONS ──
+    if snap["innings"] == 2:
+        balls_left = 120 - ball_number
+        projected_score = score_runs + (crr * balls_left / 6.0) if crr > 0 else score_runs
+        runs_remaining = max(0, target_score - score_runs)
+        relative_projection = (target_score - score_runs) / max(rrr * balls_left / 6.0, 1.0) if rrr > 0 else 0.0
+    else:
+        projected_score = score_runs + (crr * (120 - ball_number) / 6.0) if crr > 0 else score_runs
+        runs_remaining = 0
+        relative_projection = 0.0
+
+    # ── PRESSURE INDEX ──
+    pressure_index = (wickets_ratio * 2.0) + (run_rate_pressure * 0.5) + (balls_ratio * 0.5)
+
+    # ── MOMENTUM SCORE (from recent balls) ──
+    if last_18:
+        runs_18 = runs_last_18
+        momentum_score = (runs_18 / 3.0) if runs_18 > 0 else -1.0
+    else:
+        momentum_score = 0.0
+
+    # ── BATTER & BOWLER QUALITY ──
+    batter_quality = float(MODEL_A_BATTER_AVG.get(bat_team, 30.0)) / 100.0
+    bowler_quality = float(MODEL_A_BOWLER_AVG.get(bowl_team, 8.0)) / 50.0
+
+    # ── TOSS DECISION ──
+    batting_won_toss = int(ctx.get("batting_won_toss", 0))
+    toss_decision_field = 1 if (batting_won_toss and snap["innings"] == 2) else 0
 
     return {
-        "innings": snap["innings"],
+        "innings": int(snap["innings"]),
         "over": float(over_int),
         "over_norm": float(over_int) / 19.0,
-        "ball_in_over": int(ball_in_over),
         "ball_number": int(ball_number),
         "score_before": int(score_runs),
-        "wickets_before": int(snap["wickets"]),
-        "wickets_in_hand": max(0, 10 - int(snap["wickets"])),
-        "current_run_rate": float(snap["crr"]),
-        "required_rate": float(snap["rrr"]),
-        "run_rate_pressure": rr_pressure,
-        "runs_remaining": max(0, int(ctx.get("target_score", 180)) - score_runs) if snap["innings"] == 2 else 0,
+        "wickets_before": int(score_wkts),
+        "wickets_in_hand": max(0, 10 - int(score_wkts)),
+        "current_run_rate": float(crr),
+        "required_rate": float(rrr),
+        "run_rate_pressure": float(run_rate_pressure),
+        "runs_remaining": int(runs_remaining),
         "balls_remaining": max(0, 120 - ball_number),
-        "runs_per_ball_needed": (max(0, 180 - score_runs) / max(120 - ball_number, 1)) if snap["innings"] == 2 else 0.0,
-        "wicket_pressure": snap["wickets"] / 10.0,
-        "is_powerplay": 1 if over_int <= 5 else 0,
-        "is_middle": 1 if 6 <= over_int <= 14 else 0,
-        "is_death": 1 if over_int >= 15 else 0,
-        "is_innings_2": 1 if snap["innings"] == 2 else 0,
-        "rolling_3_runs": rolling_3_runs,
-        "rolling_3_wickets": rolling_3_wickets,
-        "price": snap["ltp"],
-        "implied_prob": 1.0 / max(snap["ltp"], 0.01),
-        "batting_won_toss": int(ctx.get("batting_won_toss", 0)),
-        "price_change": float(snap["ltp"]) - float(snap["prev_ltp"])
+        "is_innings_2": int(snap["innings"] == 2),
+        "runs_last_18": int(runs_last_18),
+        "wickets_last_18": int(wickets_last_18),
+        "batting_team_win_rate": float(batting_team_win_rate),
+        "bowling_team_win_rate": float(bowling_team_win_rate),
+        "team_strength_diff": float(team_strength_diff),
+        "venue_avg_score": float(venue_avg_score),
+        "batting_team_won_toss": int(batting_won_toss),
+        "toss_decision_field": int(toss_decision_field),
+        "is_powerplay": int(over_int <= 5),
+        "is_death_overs": int(over_int >= 15),
+        "run_rate_gap": float(run_rate_gap),
+        "relative_score": float(relative_score),
+        "wickets_ratio": float(wickets_ratio),
+        "balls_ratio": float(balls_ratio),
+        "pressure_index": float(pressure_index),
+        "momentum_score": float(momentum_score),
+        "recent_wickets_pressure": float(recent_wickets_pressure),
+        "batter_quality": float(batter_quality),
+        "bowler_quality": float(bowler_quality),
+        "projected_score": float(projected_score),
+        "relative_projection": float(relative_projection),
+        "bowler_wickets_last_12": int(bowler_wickets_last_12),
     }
 
 
@@ -882,41 +914,80 @@ def run_dual_prediction() -> dict:
     })
 
     feats = get_full_features(detected, snap)
-    
-    # --- MODEL A: FAIR ODDS ---
-    X_a = np.array([[feats.get(c, 0) for c in feat_cols_a]])
-    p_fair_win = float(model_a.predict_proba(X_a)[0][1])
-    fair_odds = float(1.0 / max(p_fair_win, 0.01))
 
-    # --- VALUE GAP ANALYSIS ---
+    # ── MODEL A: FAIR ODDS (FIX 6: computed relative to market favourite) ──
+    X_a = np.array([[feats.get(c, 0) for c in feat_cols_a]])
+    p_batting_win = float(model_a.predict_proba(X_a)[0][1])
+    fair_odds_batting = float(1.0 / max(p_batting_win, 0.01))
+
+    # Identify the market favourite (lowest decimal price = most likely to win)
     market_price = snap["ltp"]
+    favorite_team = ""
+    is_fav_batting = False
+
+    if snap["runners"]:
+        favorite_rid = min(snap["runners"], key=snap["runners"].get)
+        favorite_team = RUNNER_TEAM_MAP.get(str(favorite_rid), str(favorite_rid))
+        if favorite_team == snap.get("bat_team"):
+            is_fav_batting = True
+
+    # Flip fair odds to the favourite's perspective if needed.
+    # Model A always predicts P(batting team wins). If the bowling team is
+    # the favourite we must invert so the value-gap comparison is apples-to-apples.
+    if is_fav_batting:
+        fair_odds = fair_odds_batting
+        p_fair_win = p_batting_win
+    else:
+        p_fair_win = 1.0 - p_batting_win
+        fair_odds = float(1.0 / max(p_fair_win, 0.01))
+
+    # ── VALUE GAP ANALYSIS ──
     value_gap = (market_price - fair_odds) / fair_odds
 
     action, wait_reason = "WAIT", "Market aligns with situation"
 
     if value_gap > MIN_VALUE_GAP:
         action = "BACK"
-        wait_reason = f"VALUE DETECTED (+{value_gap:.1%}). Market price {market_price:.2f} > Fair {fair_odds:.2f}"
+        wait_reason = (f"VALUE DETECTED (+{value_gap:.1%}). "
+                       f"Market {favorite_team} {market_price:.2f} > Fair {fair_odds:.2f}")
     elif value_gap < -MIN_VALUE_GAP:
         action = "LAY"
-        wait_reason = f"OVER-HYPED ({value_gap:.1%}). Market price {market_price:.2f} < Fair {fair_odds:.2f}"
+        wait_reason = (f"OVER-HYPED ({value_gap:.1%}). "
+                       f"Market {favorite_team} {market_price:.2f} < Fair {fair_odds:.2f}")
     else:
-        wait_reason = f"Gap: {value_gap:+.1%}. Need >5% value gap."
+        wait_reason = f"Gap: {value_gap:+.1%}. Need >{MIN_VALUE_GAP*100:.0f}% value gap."
 
-    # ── SAFETY VETOS (FIX 5: now EV-based, fair_price passed through) ──
+    # ── SAFETY VETOS (EV-based, fair_price passed through) ──
     pre_veto_action = action
     action, safety_vetos = _safety_veto_check(action, market_price, snap, fair_price=fair_odds)
     if safety_vetos and action == "WAIT":
         wait_reason = f"SAFETY VETO ({pre_veto_action} blocked): {'; '.join(safety_vetos)}"
         print(f"[VETO] {pre_veto_action} blocked: {safety_vetos}")
 
-    # Money Management (rule_engine layer)
+    # ── MONEY MANAGEMENT (rule_engine layer) ──
     rule_res = rule_engine.evaluate(action, p_fair_win, snap)
     action = rule_res["final_action"]
     final_conf = rule_res["final_confidence"]
 
-    stake_res = _kelly_stake(BANKROLL, market_price, final_conf, KELLY_FRACTION,
-                             rule_res["stake_pct"], MIN_STAKE, is_lay=(action=="LAY"))
+    # ── FIXED STAKE & TP/SL CALCULATION (30-10-20 Strategy) ──
+    fixed_stake = BANKROLL * MAX_EXPOSURE_PCT
+    tp_price, sl_price = 0.0, 0.0
+
+    if action == "BACK":
+        tp_price = round(market_price / (1.0 + TARGET_PROFIT_PCT), 2)
+        sl_price = round(market_price / (1.0 - STOP_LOSS_PCT), 2)
+    elif action == "LAY":
+        tp_price = round(market_price / (1.0 - TARGET_PROFIT_PCT), 2)
+        sl_price = round(market_price / (1.0 + STOP_LOSS_PCT), 2)
+
+    stake_res = {
+        "recommended_stake": round(fixed_stake, 2),
+        "max_exposure": round(fixed_stake, 2),
+        "kelly": 1.0,
+        "liability": round(fixed_stake * (market_price - 1) if action == "LAY" else fixed_stake, 2),
+        "target_profit_price": tp_price,
+        "stop_loss_price": sl_price
+    }
 
     # ── CONSTRAINT VALIDATION ──
     constraint_warnings = []
@@ -942,7 +1013,6 @@ def run_dual_prediction() -> dict:
             action = "WAIT"
             wait_reason = f"Constraints blocked trade: {', '.join(constraint_warnings)}"
 
-    # 🆕 ENFORCE INT STAKE everywhere downstream sees it
     final_stake = int(final_stake)
 
     _, o_int, b_o = _parse_over_to_balls(snap["over"])
@@ -953,11 +1023,6 @@ def run_dual_prediction() -> dict:
 
     bat_team = RUNNER_TEAM_MAP.get(str(bat_team), bat_team)
     bowl_team = RUNNER_TEAM_MAP.get(str(bowl_team), bowl_team)
-
-    favorite_team = ''
-    if snap["runners"]:
-        favorite_rid = min(snap["runners"], key=snap["runners"].get)
-        favorite_team = RUNNER_TEAM_MAP.get(str(favorite_rid), favorite_rid)
 
     position_impact = {}
     if action != "WAIT" and final_stake > 0:
@@ -1023,6 +1088,7 @@ def run_dual_prediction() -> dict:
         "rule_engine": rule_res
     }
 
+
 # ─────────────────────────────────────────────────────────────────
 # LOGGING & SERVER
 # ─────────────────────────────────────────────────────────────────
@@ -1031,10 +1097,10 @@ async def predict_tick():
     ball_id = f"{state['over']}_{state['score']}"
     if ball_id == state["last_ball_id"]: return
     state["last_ball_id"] = ball_id
-    
+
     fetch_score()
     output = run_dual_prediction()
-    
+
     print(json.dumps(output, indent=2, default=json_safe))
     with open(LIVE_REPORT_FILE, "w") as f: json.dump(output, f, indent=2, default=json_safe)
     state['prev_ltp'] = state['ltp']
@@ -1047,6 +1113,7 @@ async def main():
     print(f"  API: http://{FLASK_HOST}:{FLASK_PORT}/signal")
     print("  Position Management: ENABLED")
     print("  Constraint Validation: ENABLED")
+    print(f"  Fair Price: Favourite-relative (FIX 6 applied)")
     print(f"  Safety Vetos: EV-BASED (required edge {EV_REQUIRED_EDGE_PP*100:.0f}pp, "
           f"fallback floor {FALLBACK_MIN_LAY_ODDS}/{FALLBACK_MAX_BACK_ODDS})")
     print("=" * 65)
