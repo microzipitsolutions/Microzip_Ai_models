@@ -4,8 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Cricbuzz & Market Configuration ---
-CRICBUZZ_ID  = "152064"
-MARKET_ID    = "1.257823308"
+CRICBUZZ_ID  = "152075"
+MARKET_ID    = "1.257716042"
 
 # --- API Keys ---
 # Backend team should set these in a .env file

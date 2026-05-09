@@ -43,8 +43,8 @@ import patterns_engine
 import rule_engine
 
 # ── CONFIG ────────────────────────────────────────────────────────
-CRICBUZZ_ID  = "152064"
-MARKET_ID    = "1.257823308"
+CRICBUZZ_ID  = "152075"
+MARKET_ID    = "1.257716042"
 load_dotenv()
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 
@@ -63,8 +63,8 @@ LIVE_REPORT_FILE = "live_report.json"
 MATCH_LOG_FILE   = "match_history_log.json"
 
 RUNNER_TEAM_MAP = {
-    "22121561": "Delhi Capitals",
-    "2954260": "Kolkata Knight Riders"
+    "2954266": "Rajasthan Royals",
+    "42821394": "Gujarat Titans"
 } 
 BANKROLL          = float(os.getenv("BANKROLL", "2000"))
 KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "1.0"))
