@@ -74,7 +74,7 @@ MATCH_LOG_FILE   = "match_history_log.json"
 
 RUNNER_TEAM_MAP = {
     "22121561": "Delhi Capitals",
-    "2954260": "Kolkata Knight Riders"
+    "38528100": "Punjab Kings"
 }
 BANKROLL          = float(os.getenv("BANKROLL", "2000"))
 KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "1.0"))

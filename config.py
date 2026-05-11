@@ -4,8 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Cricbuzz & Market Configuration ---
-CRICBUZZ_ID  = "152075"
-MARKET_ID    = "1.257716042"
+CRICBUZZ_ID  = "152108"
+MARKET_ID    = "1.257942254"
 
 # --- API Keys ---
 # Backend team should set these in a .env file
@@ -18,8 +18,3 @@ HISTORICAL_DB = "./data/parsed/cricsheet_all.csv"
 DETAILED_LOG  = "./live/detailed_ball_log.json"
 PRICE_FILE    = "./live/ws_price.json"
 
-# --- Runner Mapping ---
-RUNNER_TEAM_MAP = {
-    "96549129": "Rawalpindi Pindiz", "448": "Rawalpindi Pindiz",
-    "10782589": "Islamabad United", "7659": "Islamabad United"
-}
