@@ -6,7 +6,7 @@ Implements the Value-Gap strategy with the full technical output suite.
   Model A (Situational): Predicts FAIR ODDS based on Pure Cricket Logic.
   Model B (Momentum): Predicts PRICE DIRECTION based on Market History.
 
-  Logic: 
+  Logic:
     - If Market Price > Fair Price + Edge -> VALUE detected (BACK)
     - If Market Price < Fair Price - Edge -> OVER-HYPED detected (LAY)
     - Model B acts as a 'Momentum Filter' to confirm the entry.
@@ -22,6 +22,17 @@ PATCHES APPLIED:
   ✓ FIX 6: Fair price now computed relative to MARKET FAVOURITE (not always batting
            team). Probability is flipped when bowling team is the favourite, so the
            value gap comparison is always apples-to-apples.
+  ✓ FIX 7: Model A stats now loaded into unified MODEL_A_STATS dict (matches
+           predict_engine.py pattern) — fixes None lookups causing wrong fair odds.
+  ✓ FIX 8: get_full_features() aligned with predict_engine.py — consistent wickets
+           source, toss_decision_field logic, projected_score / relative_projection,
+           and batter/bowler quality lookups.
+  ✓ FIX 9: Price shock state fields added (tick_shock_buffer, tick_shock,
+           price_momentum_6b, price_volatility_12b) so run_dual_prediction() can
+           compute them before snapshotting state, matching predict_engine.py.
+  ✓ FIX 10: favourite_rid lookup now works correctly after _ingest_market_prices
+            stores team names as keys; RUNNER_TEAM_MAP fallback no longer silently
+            breaks the is_fav_batting check.
 """
 
 import asyncio
@@ -43,29 +54,28 @@ import patterns_engine
 import rule_engine
 
 # ── CONFIG ────────────────────────────────────────────────────────
-CRICBUZZ_ID  = "152075"
-MARKET_ID    = "1.257716042"
+from config import CRICBUZZ_ID, MARKET_ID
 load_dotenv()
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 
-MODEL_A_PATH  = "model_a_cricket.pkl"   # Pure Cricket (Fair Odds)
-MODEL_B_PATH  = "betpredict_model.pkl"  # Market Momentum (Unified)
+MODEL_A_PATH  = "./output/model_a_cricket.pkl"   # Pure Cricket (Fair Odds)
+MODEL_B_PATH  = "./output/betpredict_model.pkl"  # Market Momentum (Unified)
 
-HISTORICAL_DB = "cricsheet_parsed.csv"
-BETFAIR_DB    = "betfair_ipl_only.csv"
+HISTORICAL_DB = "./output/cricsheet_parsed.csv"
+BETFAIR_DB    = "./data/parsed/betfair_ipl_only.csv"
 LABELED_DB_CANDIDATES = [
-    "labeled_dataset.csv",
-    "labeled_dataset.csv",
-    "labeled_dataset.csv",
+    "./output/labeled_dataset.csv",
+    "./data/parsed/labeled_dataset.csv",
+    "./labeled_dataset.csv",
 ]
-PRICE_FILE       = "ws_price.json"
-LIVE_REPORT_FILE = "live_report.json"
-MATCH_LOG_FILE   = "match_history_log.json"
+PRICE_FILE       = "./live/ws_price.json"
+LIVE_REPORT_FILE = "./live/live_report.json"
+MATCH_LOG_FILE   = "./live/match_history_log.json"
 
 RUNNER_TEAM_MAP = {
-    "2954266": "Rajasthan Royals",
-    "42821394": "Gujarat Titans"
-} 
+    "22121561": "Delhi Capitals",
+    "2954260": "Kolkata Knight Riders"
+}
 BANKROLL          = float(os.getenv("BANKROLL", "2000"))
 KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "1.0"))
 MAX_EXPOSURE_PCT  = float(os.getenv("MAX_EXPOSURE_PCT", "0.30"))
@@ -104,6 +114,9 @@ state = {
     "over": 0.0, "crr": 0.0, "rrr": 0.0, "innings": 1,
     "recent": "", "last_ball_id": None, "stop": False,
     "price_buffer": [], "phase_stability_log": [],
+    # FIX 9: price shock fields — required by run_dual_prediction()
+    "tick_shock_buffer": [],
+    "tick_shock": 0, "price_momentum_6b": 0, "price_volatility_12b": 0,
     "api_ball_by_ball":    [],
     "api_market_prices":   {},
     "api_last_post_epoch": 0.0,
@@ -170,6 +183,21 @@ def _balls_remaining_in_phase(over_int: int, ball_in_over: int):
     else:               end = 20
     return max(0, end * 6 - (over_int * 6 + ball_in_over))
 
+def calculate_ticks(p1, p2):
+    if p1 == p2: return 0
+    if p1 is None or p2 is None: return 0
+    try:
+        start, end = min(p1, p2), max(p1, p2)
+        ticks = 0
+        curr = start
+        while curr < end - 0.0001:
+            ts = _tick_size(curr)
+            curr = round(curr + ts, 4)
+            ticks += 1
+        return ticks if p2 > p1 else -ticks
+    except Exception:
+        return 0
+
 def _kelly_stake(bankroll, odds, p_win, kelly_fraction=0.25,
                  max_exposure_pct=0.03, min_stake=50.0, is_lay=False):
     if bankroll <= 0:
@@ -187,7 +215,7 @@ def _kelly_stake(bankroll, odds, p_win, kelly_fraction=0.25,
     if is_lay:
         liability = risk_amount
         stake = liability / (odds - 1.0)
-    else: 
+    else:
         stake = risk_amount
         liability = stake
     if 0 < stake < min_stake:
@@ -544,22 +572,26 @@ trend_engine = (PriceTrendEngine(resolved_labeled) if resolved_labeled
 hist_engine  = HistoryEngine(HISTORICAL_DB)
 flip_tracker = OddsFlipTracker(BETFAIR_DB)
 
-# Global stats containers
-MODEL_A_TEAM_STATS = {}
-MODEL_A_VENUE_SCORES = {}
-MODEL_A_BATTER_AVG = {}
-MODEL_A_BOWLER_AVG = {}
+# FIX 7: Unified stats dict — same structure as predict_engine.py.
+# Old code used four flat globals (MODEL_A_TEAM_STATS etc.) which were only
+# populated if the pkl happened to include those exact keys. The unified dict
+# with safe .get() defaults guarantees the feature builder always gets numbers.
+MODEL_A_STATS = {
+    "team_stats": {},
+    "venue_avg_scores": {},
+    "batter_avg": {},
+    "bowler_avg": {},
+}
 
 try:
     with open(MODEL_A_PATH, "rb") as f:
         pkg_a = pickle.load(f)
         model_a = pkg_a["model"]
         feat_cols_a = pkg_a["feature_cols"]
-        MODEL_A_TEAM_STATS = pkg_a.get("team_stats", {})
-        MODEL_A_VENUE_SCORES = pkg_a.get("venue_avg_scores", {})
-        MODEL_A_BATTER_AVG = pkg_a.get("batter_avg", {})
-        MODEL_A_BOWLER_AVG = pkg_a.get("bowler_avg", {})
-    print(f"[LOAD] Model A Loaded successfully. Features: {feat_cols_a}")
+        for key in MODEL_A_STATS.keys():
+            if key in pkg_a:
+                MODEL_A_STATS[key] = pkg_a[key]
+    print(f"[LOAD] Model A loaded. Features: {len(feat_cols_a)}")
 except Exception as e:
     print(f"[FATAL] Model A Load Fail: {e}")
     exit(1)
@@ -625,8 +657,32 @@ def signal_endpoint():
     with state_lock:
         state["match_id"] = body.get("match_id", "")
 
+        # Extract team names from match_id (format: "Team A vs Team B")
+        match_id = state["match_id"]
+        if match_id and " vs " in match_id:
+            teams = match_id.split(" vs ")
+            state["bat_team"] = teams[0].strip()
+            state["bowl_team"] = teams[1].strip()
+
         score_raw = body.get("score", "").strip()
-        state["score"] = score_raw if score_raw and "/" in score_raw else "0/0"
+        # Handle both "123/4" and "Team 123-4 (5.2) | Opp 0-0 (0.0)" formats
+        if "/" in score_raw:
+            state["score"] = score_raw
+        elif "-" in score_raw:
+            # Extract from "Team 123-4 (5.2)" format
+            parts = score_raw.split("|")[0].strip()  # Get first team's part
+            if "-" in parts:
+                try:
+                    score_part = parts.split()[-2]  # e.g., "123-4"
+                    runs, wickets = score_part.split("-")
+                    state["score"] = f"{runs}/{wickets}"
+                    # Extract over from parentheses: (5.2)
+                    over_str = parts.split()[-1].strip("()")
+                    state["over"] = float(over_str)
+                except:
+                    state["score"] = "0/0"
+        else:
+            state["score"] = "0/0"
 
         mp = body.get("market_prices", {})
         if isinstance(mp, dict) and mp:
@@ -766,7 +822,7 @@ def fetch_score():
 
 
 # ─────────────────────────────────────────────────────────────────
-# FEATURE BUILDER (Full Suite)
+# FEATURE BUILDER — aligned with predict_engine.py (FIX 8)
 # ─────────────────────────────────────────────────────────────────
 
 def _parse_score_string(score: str):
@@ -783,7 +839,9 @@ def _parse_recent_balls(recent: str):
         digits = "".join(filter(str.isdigit, tok))
         runs = int(digits) if digits else 0
         wicket = 1 if "W" in upper else 0
-        balls.append({"runs": runs, "wicket": wicket, "boundary": 1 if runs in (4, 6) else 0, "dot": 1 if (runs == 0 and wicket == 0) else 0})
+        balls.append({"runs": runs, "wicket": wicket,
+                      "boundary": 1 if runs in (4, 6) else 0,
+                      "dot": 1 if (runs == 0 and wicket == 0) else 0})
     return balls
 
 def get_full_features(detected_patterns, snap):
@@ -793,108 +851,111 @@ def get_full_features(detected_patterns, snap):
     over_val = float(snap.get("over", 0.0))
     _, over_int, ball_in_over = _parse_over_to_balls(over_val)
     ball_number = over_int * 6 + ball_in_over
-    score_runs, score_wkts = _parse_score_string(snap.get("score", "0/0"))
-    target_score = int(ctx.get("target_score", 180))
+    score_runs, _ = _parse_score_string(snap.get("score", "0/0"))
 
-    # ── ROLLING BALL METRICS (18 and 12 balls) ──
+    # FIX 8a: always read wickets from state["wickets"], not from the score
+    # string — the score string may lag by one delivery.
+    wickets = int(snap.get("wickets", 0))
+
+    # ── ROLLING BALL METRICS ──
+    # FIX 8b: fall back to recent-string parse when api_ball_by_ball is empty,
+    # matching predict_engine.py behaviour.
     bbb = snap.get("api_ball_by_ball", [])
+    if not bbb and snap.get("recent"):
+        bbb = _parse_recent_balls(snap["recent"])
     bbb = [b for b in bbb if isinstance(b, dict)]
 
     last_18 = bbb[-18:] if len(bbb) >= 18 else bbb
     runs_last_18 = sum(b.get("runs", 0) for b in last_18)
-    wickets_last_18 = sum(b.get("wicket", 0) or b.get("is_wicket", 0) for b in last_18)
+    wkts_last_18 = sum(b.get("wicket", 0) or b.get("is_wicket", 0) for b in last_18)
 
     last_12 = bbb[-12:] if len(bbb) >= 12 else bbb
-    bowler_wickets_last_12 = sum(b.get("wicket", 0) or b.get("is_wicket", 0) for b in last_12)
-    recent_wickets_pressure = wickets_last_18 / 3.0 if last_18 else 0.0
+    bowler_wkts_last_12 = sum(b.get("wicket", 0) or b.get("is_wicket", 0) for b in last_12)
 
-    # ── TEAM & VENUE STATS ──
-    bat_team = snap.get("bat_team", "Unknown")
-    bowl_team = snap.get("bowl_team", "Unknown")
-    venue = ctx.get("venue", "neutral")
+    # ── TEAM & VENUE STATS — FIX 7/8c ──
+    bat_team  = snap.get("bat_team", "")
+    bowl_team = snap.get("bowl_team", "")
+    venue     = ctx.get("venue", "neutral")
 
-    batting_team_win_rate = float(MODEL_A_TEAM_STATS.get(bat_team, 0.5))
-    bowling_team_win_rate = float(MODEL_A_TEAM_STATS.get(bowl_team, 0.5))
-    team_strength_diff = batting_team_win_rate - bowling_team_win_rate
-    venue_avg_score = float(MODEL_A_VENUE_SCORES.get(venue, 160.0))
+    ts_map = MODEL_A_STATS.get("team_stats", {})
+    bat_win_rate  = float(ts_map.get(bat_team, 0.5))
+    bowl_win_rate = float(ts_map.get(bowl_team, 0.5))
 
-    # ── RATE PRESSURES ──
+    vs_map = MODEL_A_STATS.get("venue_avg_scores", {})
+    venue_avg = float(vs_map.get(venue, 160.0))
+
+    # ── RATE CALCULATIONS ──
     crr = float(snap.get("crr", 0.0))
     rrr = float(snap.get("rrr", 0.0))
-    run_rate_pressure = (rrr / max(crr, 0.1)) if snap["innings"] == 2 else (crr / 8.0)
-    run_rate_pressure = max(0.0, min(5.0, run_rate_pressure))
-    run_rate_gap = rrr - crr if snap["innings"] == 2 else 0.0
+    is_inn2 = 1 if int(snap.get("innings", 1)) == 2 else 0
 
-    # ── SCORE & WICKET RATIOS ──
-    wickets_ratio = score_wkts / 10.0
-    balls_ratio = float(ball_number) / 120.0
-    relative_score = float(score_runs) / max(venue_avg_score, 1.0)
+    rr_pressure = (rrr / max(crr, 0.1)) if is_inn2 else (crr / 8.0)
+    rr_pressure = max(0.0, min(5.0, rr_pressure))
 
-    # ── PROJECTIONS ──
-    if snap["innings"] == 2:
-        balls_left = 120 - ball_number
-        projected_score = score_runs + (crr * balls_left / 6.0) if crr > 0 else score_runs
-        runs_remaining = max(0, target_score - score_runs)
-        relative_projection = (target_score - score_runs) / max(rrr * balls_left / 6.0, 1.0) if rrr > 0 else 0.0
+    target_score = int(ctx.get("target_score", 180))
+    runs_rem  = max(0, target_score - score_runs) if is_inn2 else 0
+    balls_rem = max(0, 120 - ball_number)
+
+    # ── PROJECTIONS — FIX 8d ──
+    # predict_engine.py sets projected_score = target_score in innings 2
+    # (the target is known, so projecting via CRR is redundant/misleading).
+    if is_inn2:
+        projected_score = float(target_score)
+        relative_projection = (
+            (target_score - score_runs) / max(rrr * balls_rem / 6.0, 1.0)
+            if rrr > 0 else 0.0
+        )
     else:
-        projected_score = score_runs + (crr * (120 - ball_number) / 6.0) if crr > 0 else score_runs
-        runs_remaining = 0
+        projected_score = score_runs + (crr * (balls_rem / 6.0)) if crr > 0 else float(score_runs)
         relative_projection = 0.0
 
-    # ── PRESSURE INDEX ──
-    pressure_index = (wickets_ratio * 2.0) + (run_rate_pressure * 0.5) + (balls_ratio * 0.5)
+    # ── BATTER / BOWLER QUALITY — FIX 8e ──
+    batter_avg_map = MODEL_A_STATS.get("batter_avg", {})
+    bowler_avg_map = MODEL_A_STATS.get("bowler_avg", {})
+    batter_quality = float(batter_avg_map.get(bat_team, 30.0)) / 100.0
+    bowler_quality = float(bowler_avg_map.get(bowl_team, 8.0)) / 50.0
 
-    # ── MOMENTUM SCORE (from recent balls) ──
-    if last_18:
-        runs_18 = runs_last_18
-        momentum_score = (runs_18 / 3.0) if runs_18 > 0 else -1.0
-    else:
-        momentum_score = 0.0
-
-    # ── BATTER & BOWLER QUALITY ──
-    batter_quality = float(MODEL_A_BATTER_AVG.get(bat_team, 30.0)) / 100.0
-    bowler_quality = float(MODEL_A_BOWLER_AVG.get(bowl_team, 8.0)) / 50.0
-
-    # ── TOSS DECISION ──
+    # ── TOSS — FIX 8f ──
     batting_won_toss = int(ctx.get("batting_won_toss", 0))
-    toss_decision_field = 1 if (batting_won_toss and snap["innings"] == 2) else 0
+    # predict_engine.py: toss_decision_field = 1 when toss_decision == "field"
+    toss_decision_field = 1 if ctx.get("toss_decision") == "field" else 0
 
     return {
-        "innings": int(snap["innings"]),
-        "over": float(over_int),
-        "over_norm": float(over_int) / 19.0,
-        "ball_number": int(ball_number),
-        "score_before": int(score_runs),
-        "wickets_before": int(score_wkts),
-        "wickets_in_hand": max(0, 10 - int(score_wkts)),
-        "current_run_rate": float(crr),
-        "required_rate": float(rrr),
-        "run_rate_pressure": float(run_rate_pressure),
-        "runs_remaining": int(runs_remaining),
-        "balls_remaining": max(0, 120 - ball_number),
-        "is_innings_2": int(snap["innings"] == 2),
-        "runs_last_18": int(runs_last_18),
-        "wickets_last_18": int(wickets_last_18),
-        "batting_team_win_rate": float(batting_team_win_rate),
-        "bowling_team_win_rate": float(bowling_team_win_rate),
-        "team_strength_diff": float(team_strength_diff),
-        "venue_avg_score": float(venue_avg_score),
-        "batting_team_won_toss": int(batting_won_toss),
-        "toss_decision_field": int(toss_decision_field),
-        "is_powerplay": int(over_int <= 5),
-        "is_death_overs": int(over_int >= 15),
-        "run_rate_gap": float(run_rate_gap),
-        "relative_score": float(relative_score),
-        "wickets_ratio": float(wickets_ratio),
-        "balls_ratio": float(balls_ratio),
-        "pressure_index": float(pressure_index),
-        "momentum_score": float(momentum_score),
-        "recent_wickets_pressure": float(recent_wickets_pressure),
-        "batter_quality": float(batter_quality),
-        "bowler_quality": float(bowler_quality),
-        "projected_score": float(projected_score),
-        "relative_projection": float(relative_projection),
-        "bowler_wickets_last_12": int(bowler_wickets_last_12),
+        "innings":               int(snap.get("innings", 1)),
+        "over":                  float(over_int),
+        "over_norm":             float(over_int) / 19.0,
+        "ball_number":           int(ball_number),
+        "score_before":          int(score_runs),
+        "wickets_before":        wickets,
+        "wickets_in_hand":       max(0, 10 - wickets),
+        "current_run_rate":      crr,
+        "required_rate":         rrr,
+        "run_rate_pressure":     rr_pressure,
+        "runs_remaining":        runs_rem,
+        "balls_remaining":       balls_rem,
+        "is_innings_2":          is_inn2,
+        "runs_last_18":          int(runs_last_18),
+        "wickets_last_18":       int(wkts_last_18),
+        "batting_team_win_rate": bat_win_rate,
+        "bowling_team_win_rate": bowl_win_rate,
+        "team_strength_diff":    bat_win_rate - bowl_win_rate,
+        "venue_avg_score":       venue_avg,
+        "batting_team_won_toss": batting_won_toss,
+        "toss_decision_field":   toss_decision_field,
+        "is_powerplay":          1 if over_int < 6 else 0,
+        "is_death_overs":        1 if over_int >= 15 else 0,
+        "run_rate_gap":          (rrr - crr) if is_inn2 else 0.0,
+        "relative_score":        float(score_runs) / max(venue_avg, 1.0),
+        "wickets_ratio":         float(wickets) / 10.0,
+        "balls_ratio":           float(ball_number) / 120.0,
+        "pressure_index":        (wickets * 2.0) + (rr_pressure * 0.5) + (ball_number / 120.0 * 0.5),
+        "momentum_score":        (runs_last_18 / 3.0) if runs_last_18 > 0 else -1.0,
+        "recent_wickets_pressure": wkts_last_18 / 3.0 if last_18 else 0.0,
+        "batter_quality":        batter_quality,
+        "bowler_quality":        bowler_quality,
+        "projected_score":       projected_score,
+        "relative_projection":   relative_projection,
+        "bowler_wickets_last_12": int(bowler_wkts_last_12),
     }
 
 
@@ -904,6 +965,24 @@ def get_full_features(detected_patterns, snap):
 
 def run_dual_prediction() -> dict:
     with state_lock:
+        # FIX 9: compute price-shock features inside the lock, same as
+        # predict_engine.py, before we snapshot state.
+        current_ltp = float(state["ltp"])
+        prev_ltp    = float(state["prev_ltp"])
+        ts = calculate_ticks(prev_ltp, current_ltp)
+
+        state["tick_shock_buffer"].append(ts)
+        if len(state["tick_shock_buffer"]) > 30:
+            state["tick_shock_buffer"].pop(0)
+
+        mom = sum(state["tick_shock_buffer"][-6:])
+        vol = (np.std(state["tick_shock_buffer"][-12:])
+               if len(state["tick_shock_buffer"]) >= 2 else 0)
+
+        state["tick_shock"]          = ts
+        state["price_momentum_6b"]   = mom
+        state["price_volatility_12b"] = vol
+
         snap = {k: (v.copy() if isinstance(v, (dict, list)) else v) for k, v in state.items()}
 
     detected = patterns_engine.detect_patterns({
@@ -915,31 +994,31 @@ def run_dual_prediction() -> dict:
 
     feats = get_full_features(detected, snap)
 
-    # ── MODEL A: FAIR ODDS (FIX 6: computed relative to market favourite) ──
+    # ── MODEL A: FAIR ODDS ──
     X_a = np.array([[feats.get(c, 0) for c in feat_cols_a]])
     p_batting_win = float(model_a.predict_proba(X_a)[0][1])
     fair_odds_batting = float(1.0 / max(p_batting_win, 0.01))
 
-    # Identify the market favourite (lowest decimal price = most likely to win)
-    market_price = snap["ltp"]
+    # FIX 10: after _ingest_market_prices, snap["runners"] keys are team
+    # names (not runner IDs). min() on team-name keys gives the favourite's
+    # team name directly — no RUNNER_TEAM_MAP lookup needed here.
+    market_price  = snap["ltp"]
     favorite_team = ""
     is_fav_batting = False
 
     if snap["runners"]:
-        favorite_rid = min(snap["runners"], key=snap["runners"].get)
-        favorite_team = RUNNER_TEAM_MAP.get(str(favorite_rid), str(favorite_rid))
+        # snap["runners"] = {team_name: decimal_price, ...}
+        favorite_team = min(snap["runners"], key=snap["runners"].get)
         if favorite_team == snap.get("bat_team"):
             is_fav_batting = True
 
     # Flip fair odds to the favourite's perspective if needed.
-    # Model A always predicts P(batting team wins). If the bowling team is
-    # the favourite we must invert so the value-gap comparison is apples-to-apples.
     if is_fav_batting:
         fair_odds = fair_odds_batting
         p_fair_win = p_batting_win
     else:
         p_fair_win = 1.0 - p_batting_win
-        fair_odds = float(1.0 / max(p_fair_win, 0.01))
+        fair_odds  = float(1.0 / max(p_fair_win, 0.01))
 
     # ── VALUE GAP ANALYSIS ──
     value_gap = (market_price - fair_odds) / fair_odds
@@ -965,8 +1044,8 @@ def run_dual_prediction() -> dict:
         print(f"[VETO] {pre_veto_action} blocked: {safety_vetos}")
 
     # ── MONEY MANAGEMENT (rule_engine layer) ──
-    rule_res = rule_engine.evaluate(action, p_fair_win, snap)
-    action = rule_res["final_action"]
+    rule_res = rule_engine.evaluate(action, p_fair_win, snap, value_gap=value_gap)
+    action     = rule_res["final_action"]
     final_conf = rule_res["final_confidence"]
 
     # ── FIXED STAKE & TP/SL CALCULATION (30-10-20 Strategy) ──
@@ -1017,11 +1096,19 @@ def run_dual_prediction() -> dict:
 
     _, o_int, b_o = _parse_over_to_balls(snap["over"])
 
-    team_names = list(snap["runners"].keys()) if snap["runners"] else []
-    bat_team = snap.get('bat_team') or (team_names[0] if len(team_names) > 0 else 'Team A')
-    bowl_team = snap.get('bowl_team') or (team_names[1] if len(team_names) > 1 else 'Team B')
+    # Prefer team names from API (extracted from match_id), fall back to runners
+    bat_team  = snap.get('bat_team', '').strip()
+    bowl_team = snap.get('bowl_team', '').strip()
 
-    bat_team = RUNNER_TEAM_MAP.get(str(bat_team), bat_team)
+    if not bat_team or not bowl_team:
+        team_names = list(snap["runners"].keys()) if snap["runners"] else []
+        if not bat_team:
+            bat_team = team_names[0] if len(team_names) > 0 else 'Team A'
+        if not bowl_team:
+            bowl_team = team_names[1] if len(team_names) > 1 else 'Team B'
+
+    # Resolve team names through map only if they look like runner IDs
+    bat_team  = RUNNER_TEAM_MAP.get(str(bat_team),  bat_team)
     bowl_team = RUNNER_TEAM_MAP.get(str(bowl_team), bowl_team)
 
     position_impact = {}
@@ -1032,10 +1119,8 @@ def run_dual_prediction() -> dict:
             snap["current_book"], snap["total_exposure"]
         )
 
-    normalized_runners = {}
-    for runner_key, odds in snap["runners"].items():
-        team_name = RUNNER_TEAM_MAP.get(str(runner_key), runner_key)
-        normalized_runners[team_name] = odds
+    # snap["runners"] already has team names as keys after _ingest_market_prices
+    normalized_runners = dict(snap["runners"])
 
     return {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
@@ -1094,11 +1179,13 @@ def run_dual_prediction() -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 async def predict_tick():
+    # Fetch score BEFORE ball_id check so state is always fresh
+    fetch_score()
+
     ball_id = f"{state['over']}_{state['score']}"
     if ball_id == state["last_ball_id"]: return
     state["last_ball_id"] = ball_id
 
-    fetch_score()
     output = run_dual_prediction()
 
     print(json.dumps(output, indent=2, default=json_safe))

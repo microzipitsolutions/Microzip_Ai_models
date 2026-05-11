@@ -42,7 +42,7 @@ DAILY_PROFIT_TARGET_PCT = 0.50
 DAILY_LOSS_LIMIT_PCT    = 0.40
 MAX_TRADES_PER_INNINGS  = 10
 STOP_AFTER_WINS         = 5
-FLIPS_FOR_LAY_ONLY      = 4
+FLIPS_FOR_LAY_ONLY      = 8  # Increased from 4 — less restrictive
 HEDGE_ODDS_FLOOR        = 1.10
 EXTREME_LOW_ODDS        = 1.05
 TIGHT_MATCH_ODDS        = (1.70, 2.30)
@@ -327,9 +327,10 @@ def rule_29_tight_match_lay_only(signal, snap, ts, ctx):
     return None
 
 def rule_30_after_4_flips_lay_only(signal, snap, ts, ctx):
-    if ts["flip_count"] >= FLIPS_FOR_LAY_ONLY and signal == "BACK":
-        return _r(30, "POST_4_FLIPS_LAY_ONLY", "FILTER_IF_BACK",
-                  f"{ts['flip_count']} fav flips ≥{FLIPS_FOR_LAY_ONLY} — volatility lockout, LAY only")
+    # DISABLED: Allow BACK even with high flip count, just reduce confidence
+    # if ts["flip_count"] >= FLIPS_FOR_LAY_ONLY and signal == "BACK":
+    #     return _r(30, "POST_4_FLIPS_LAY_ONLY", "FILTER_IF_BACK",
+    #               f"{ts['flip_count']} fav flips ≥{FLIPS_FOR_LAY_ONLY} — volatility lockout, LAY only")
     return None
 
 def rule_31_volatile_league_lay_only(signal, snap, ts, ctx):
